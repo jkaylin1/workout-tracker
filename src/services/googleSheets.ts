@@ -6,13 +6,6 @@ interface SheetResponse {
   values: string[][];
 }
 
-interface CellUpdate {
-  promise: Promise<void>;
-  row: number;
-  col: number;
-  value: string;
-}
-
 class GoogleSheetsService {
   private readonly SPREADSHEET_ID: string;
 
@@ -26,9 +19,60 @@ class GoogleSheetsService {
     return token;
   }
 
+  private parseDate(date: Date): string {
+    return `${date.getMonth() + 1}/${date.getDate()}`;
+  }
+
+  private normalizeDate(dateStr: string): string {
+    if (!dateStr) return '';
+    dateStr = dateStr.trim();
+    const dateParts = dateStr.split(' ');
+    if (dateParts.length > 1) {
+      dateStr = dateParts[dateParts.length - 1];
+    }
+    if (dateStr.includes('/')) {
+      const parts = dateStr.split('/');
+      return `${parseInt(parts[0])}/${parseInt(parts[1])}`;
+    }
+    return dateStr;
+  }
+
+  private getColumnLetter(col: number): string {
+    let letter = '';
+    while (col >= 0) {
+      letter = String.fromCharCode(65 + (col % 26)) + letter;
+      col = Math.floor(col / 26) - 1;
+    }
+    return letter;
+  }
+
+  private async batchUpdate(updates: { range: string; values: string[][] }[]): Promise<void> {
+    if (updates.length === 0) return;
+
+    const token = this.getAuthToken();
+    const response = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${this.SPREADSHEET_ID}/values:batchUpdate`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          valueInputOption: 'USER_ENTERED',
+          data: updates
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(`Batch update failed: ${error.error?.message || response.statusText}`);
+    }
+  }
+
   private async fetchSheetData(range: string): Promise<SheetResponse> {
     const token = this.getAuthToken();
-
     const response = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${this.SPREADSHEET_ID}/values/${range}`,
       {
@@ -39,76 +83,10 @@ class GoogleSheetsService {
     );
 
     if (!response.ok) {
-      if (response.status === 401) {
-        localStorage.removeItem('gapi_access_token');
-        throw new Error('Authentication expired');
-      }
-      throw new Error(`API request failed: ${response.status}`);
+      throw new Error(`Failed to fetch sheet data: ${response.statusText}`);
     }
 
     return response.json();
-  }
-
-  private parseDate(date: Date): string {
-    return `${date.getMonth() + 1}/${date.getDate()}`;
-  }
-
-  private normalizeDate(dateStr: string): string {
-    if (!dateStr) return '';
-    
-    // Remove any leading/trailing whitespace
-    dateStr = dateStr.trim();
-    
-    // Extract the date portion if it includes day of week (e.g., "Thu 12/12")
-    const dateParts = dateStr.split(' ');
-    if (dateParts.length > 1) {
-      // Take the last part which should be the actual date
-      dateStr = dateParts[dateParts.length - 1];
-    }
-    
-    // If the date includes a year, remove it
-    if (dateStr.includes('/')) {
-      const parts = dateStr.split('/');
-      if (parts.length === 3) {
-        // If it's MM/DD/YYYY format, take just MM/DD
-        return `${parts[0]}/${parts[1]}`;
-      }
-    }
-    
-    return dateStr;
-  }
-
-  private parseExerciseRow(row: string[]): Exercise | null {
-    // Skip if no exercise name in column I (index 8)
-    if (!row[8]) return null;
-
-    const sets = [];
-    // Process three possible sets using the correct column indices
-    const setGroups = [
-      { reps: 14, weight: 15, rir: 16 },  // O, P, Q columns (0-based)
-      { reps: 17, weight: 18, rir: 19 },  // R, S, T columns
-      { reps: 20, weight: 21, rir: 22 }   // U, V, W columns
-    ];
-
-    for (const group of setGroups) {
-      // Only add set if reps value exists and is a number
-      const repsStr = row[group.reps];
-      if (repsStr && !isNaN(Number(repsStr))) {
-        const weightStr = row[group.weight];
-        const rirStr = row[group.rir];
-        
-        sets.push({
-          reps: parseInt(repsStr) || 0,
-          weight: parseFloat(weightStr) || 0,
-          rir: parseInt(rirStr) || 0
-        });
-      }
-    }
-
-    return {
-      name: row[8].trim(),  // Column I, remove any whitespace
-      sets
-    };
   }
 
   async getWorkoutData(date: string): Promise<WorkoutData> {
@@ -122,22 +100,41 @@ class GoogleSheetsService {
       
       // Find rows matching the date
       const matchingWorkoutRows = workoutRows.filter(row => {
-        if (!row[6]) return false; // Skip rows with no date
+        if (!row[6]) return false;
         const rowDate = this.normalizeDate(row[6]);
         const matches = rowDate === parsedDate;
-        console.log(`Comparing row date '${row[6]}' (normalized: '${rowDate}') with parsed date '${parsedDate}'`, matches);
         return matches;
       });
       
-      console.log('Found matching workout rows:', matchingWorkoutRows);
-
       // Process exercises
       const exercises: Exercise[] = [];
       for (const row of matchingWorkoutRows) {
-        const exercise = this.parseExerciseRow(row);
-        if (exercise) {
-          exercises.push(exercise);
+        if (!row[8]) continue; // Skip if no exercise name
+
+        const sets = [];
+        // Process sets
+        const setGroups = [
+          { reps: 14, weight: 15, rir: 16 },  // First set
+          { reps: 17, weight: 18, rir: 19 },  // Second set
+          { reps: 20, weight: 21, rir: 22 }   // Third set
+        ];
+
+        for (const group of setGroups) {
+          const repsStr = row[group.reps];
+          if (repsStr && !isNaN(Number(repsStr))) {
+            sets.push({
+              reps: parseInt(repsStr) || 0,
+              weight: parseFloat(row[group.weight]) || 0,
+              rir: parseInt(row[group.rir]) || 0
+            });
+          }
         }
+
+        exercises.push({
+          name: row[8].trim(),
+          sets,
+          notes: row[37] || '' // Column AL (37) for notes
+        });
       }
 
       // Fetch cardio data
@@ -150,10 +147,8 @@ class GoogleSheetsService {
         return this.normalizeDate(row[5]) === parsedDate;
       });
       
-      console.log('Found matching cardio row:', cardioRow);
-
       const cardio: CardioSession = cardioRow ? {
-        modality: cardioRow[8] || '',     // Column I
+        modality: cardioRow[8] || '',      // Column I
         minutes: parseInt(cardioRow[11]) || 0,  // Column L
         seconds: parseInt(cardioRow[12]) || 0,  // Column M
         rpe: parseInt(cardioRow[16]) || 0,      // Column Q
@@ -170,10 +165,7 @@ class GoogleSheetsService {
         notes: ''
       };
 
-      const result = { date, exercises, cardio };
-      console.log('Processed workout data:', result);
-      return result;
-
+      return { date, exercises, cardio };
     } catch (error) {
       console.error('Error in getWorkoutData:', error);
       throw error;
@@ -181,128 +173,91 @@ class GoogleSheetsService {
   }
 
   async updateWorkoutData(date: string, workoutData: WorkoutData): Promise<void> {
-    const parsedDate = this.parseDate(new Date(date));
-    
     try {
-      // Get existing data first to find the rows we need to update
+      const parsedDate = this.parseDate(new Date(date));
+      console.log('Updating data for date:', parsedDate);
+      
+      // Get workout data
       const workoutResponse = await this.fetchSheetData("'workout log'!A:AL");
       const workoutRows = workoutResponse.values || [];
       
-      // Find the row indices for each exercise
+      // Find rows for current date
+      const dateRows = workoutRows.reduce((acc, row, index) => {
+        const rowDate = this.normalizeDate(row[6]);
+        if (rowDate === parsedDate) {
+          acc[row[8]?.trim().toLowerCase()] = index + 1;
+        }
+        return acc;
+      }, {} as Record<string, number>);
+
+      // Prepare workout updates
+      const workoutUpdates = [];
+      
       for (const exercise of workoutData.exercises) {
-        const rowIndex = workoutRows.findIndex(row => 
-          row[6] === parsedDate && row[8] === exercise.name
-        );
-        
-        if (rowIndex !== -1) {
-          // Update the sets data
-          const updates: CellUpdate[] = [];
+        const rowIndex = dateRows[exercise.name.toLowerCase()];
+        if (rowIndex) {
+          // Update sets
           exercise.sets.forEach((set, setIndex) => {
-            const baseCol = setIndex * 3 + 14;  // Start at column N (14)
-            updates.push(
+            const baseCol = 14 + (setIndex * 3);
+            
+            workoutUpdates.push(
               {
-                promise: this.updateCell(rowIndex + 1, baseCol, set.reps.toString()),
-                row: rowIndex + 1,
-                col: baseCol,
-                value: set.reps.toString()
+                range: `'workout log'!${this.getColumnLetter(baseCol)}${rowIndex}`,
+                values: [[set.reps.toString()]]
               },
               {
-                promise: this.updateCell(rowIndex + 1, baseCol + 1, set.weight.toString()),
-                row: rowIndex + 1,
-                col: baseCol + 1,
-                value: set.weight.toString()
+                range: `'workout log'!${this.getColumnLetter(baseCol + 1)}${rowIndex}`,
+                values: [[set.weight.toString()]]
               },
               {
-                promise: this.updateCell(rowIndex + 1, baseCol + 2, set.rir.toString()),
-                row: rowIndex + 1,
-                col: baseCol + 2,
-                value: set.rir.toString()
+                range: `'workout log'!${this.getColumnLetter(baseCol + 2)}${rowIndex}`,
+                values: [[set.rir.toString()]]
               }
             );
           });
-          
-          await Promise.all(updates.map(update => update.promise));
+
+          // Only add notes update if this specific exercise has notes
+          if (exercise.notes) {
+            workoutUpdates.push({
+              range: `'workout log'!AL${rowIndex}`,
+              values: [[exercise.notes]]
+            });
+          }
         }
       }
 
-      // Update cardio data
+      // Process workout updates
+      await this.batchUpdate(workoutUpdates);
+
+      // Process cardio updates
       const cardioResponse = await this.fetchSheetData("'cardio log'!A:BM");
       const cardioRows = cardioResponse.values || [];
-      const cardioRowIndex = cardioRows.findIndex(row => row[5] === parsedDate);
+      const cardioRowIndex = cardioRows.findIndex(row => 
+        this.normalizeDate(row[5]) === parsedDate
+      );
       
       if (cardioRowIndex !== -1) {
-        const cardioUpdates: CellUpdate[] = [
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 8, workoutData.cardio.modality),
-            row: cardioRowIndex + 1,
-            col: 8,
-            value: workoutData.cardio.modality
-          },
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 11, workoutData.cardio.minutes.toString()),
-            row: cardioRowIndex + 1,
-            col: 11,
-            value: workoutData.cardio.minutes.toString()
-          },
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 12, workoutData.cardio.seconds.toString()),
-            row: cardioRowIndex + 1,
-            col: 12,
-            value: workoutData.cardio.seconds.toString()
-          },
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 16, workoutData.cardio.rpe.toString()),
-            row: cardioRowIndex + 1,
-            col: 16,
-            value: workoutData.cardio.rpe.toString()
-          },
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 17, workoutData.cardio.workRest),
-            row: cardioRowIndex + 1,
-            col: 17,
-            value: workoutData.cardio.workRest
-          },
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 24, workoutData.cardio.watts.toString()),
-            row: cardioRowIndex + 1,
-            col: 24,
-            value: workoutData.cardio.watts.toString()
-          },
-          {
-            promise: this.updateCell(cardioRowIndex + 1, 63, workoutData.cardio.notes),
-            row: cardioRowIndex + 1,
-            col: 63,
-            value: workoutData.cardio.notes
-          }
-        ];
-        
-        await Promise.all(cardioUpdates.map(update => update.promise));
+        const cardioUpdates = [
+          { col: 8, value: workoutData.cardio.modality },
+          { col: 11, value: workoutData.cardio.minutes.toString() },
+          { col: 12, value: workoutData.cardio.seconds.toString() },
+          { col: 16, value: workoutData.cardio.rpe.toString() },
+          { col: 17, value: workoutData.cardio.workRest },
+          { col: 24, value: workoutData.cardio.watts.toString() },
+          { col: 63, value: workoutData.cardio.notes }
+        ].map(update => ({
+          range: `'cardio log'!${this.getColumnLetter(update.col)}${cardioRowIndex + 1}`,
+          values: [[update.value]]
+        }));
+
+        await this.batchUpdate(cardioUpdates);
       }
+      
+      console.log('Successfully updated workout data');
     } catch (error) {
       console.error('Error updating workout data:', error);
       throw error;
     }
-  }
-
-  private async updateCell(row: number, col: number, value: string): Promise<void> {
-    const token = this.getAuthToken();
-    const colLetter = String.fromCharCode(65 + col); // Convert column number to letter
-    const range = `${colLetter}${row}`;
-    
-    await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${this.SPREADSHEET_ID}/values/${range}?valueInputOption=USER_ENTERED`,
-      {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          range,
-          values: [[value]]
-        })
-      }
-    );
   }
 }
 
